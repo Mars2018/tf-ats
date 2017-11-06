@@ -148,8 +148,8 @@ with tf.variable_scope("model", initializer=tf.truncated_normal_initializer(seed
         
     #############################################################################################
     
-    if FLAGS.num_highway_layers > 0:
-        output = highway(output, output.get_shape()[-1], num_layers=FLAGS.num_highway_layers)# tf.shape(output)[-1] # output.get_shape()[-1]
+#     if FLAGS.num_highway_layers > 0:
+#         output = highway(output, output.get_shape()[-1], num_layers=FLAGS.num_highway_layers)# tf.shape(output)[-1] # output.get_shape()[-1]
     
     #############################################################################################
     
