@@ -18,6 +18,7 @@ from nlp.readers.vocab import Vocab
 from nlp.readers.text_reader import GlobReader, TextParser, FieldParser, EssayBatcher, REGEX_NUM
 
 from model import highway, linear
+import sonnet_modules as sm
 
 import options
 
@@ -115,29 +116,42 @@ with tf.variable_scope("model", initializer=tf.truncated_normal_initializer(seed
     rnn_inputs = tf.nn.embedding_lookup(E, inputs)
     
     
+    ####################################################################################
     ''' BUILD RNN '''
-    keep_prob = tf.placeholder_with_default(1.0, shape=())
-    def create_rnn_cell():
-        
-        cell = tf.contrib.rnn.BasicLSTMCell(FLAGS.rnn_dim, state_is_tuple=True, forget_bias=0.0, reuse=False)
-        #cell = tf.nn.rnn_cell.LSTMCell(FLAGS.rnn_dim, state_is_tuple=True, forget_bias=0.0, reuse=False, use_peepholes=True)
-        
-        ## dropout ##
-        cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=keep_prob)#==1.-FLAGS.dropout
-        return cell
-            
-    if FLAGS.rnn_layers > 1:
-        cell = tf.contrib.rnn.MultiRNNCell([create_rnn_cell() for _ in range(FLAGS.rnn_layers)], state_is_tuple=True)
-    else:
-        cell = create_rnn_cell() 
-    initial_rnn_state = cell.zero_state(batch_size, dtype=tf.float32)
+#     keep_prob = tf.placeholder_with_default(1.0, shape=())
+#     def create_rnn_cell():
+#         cell = tf.contrib.rnn.BasicLSTMCell(FLAGS.rnn_dim, state_is_tuple=True, forget_bias=0.0, reuse=False)
+#         #cell = tf.nn.rnn_cell.LSTMCell(FLAGS.rnn_dim, state_is_tuple=True, forget_bias=0.0, reuse=False, use_peepholes=True)
+#         #############
+#         ## dropout ##
+#         cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=keep_prob)#==1.-FLAGS.dropout
+#         return cell
+#             
+#     if FLAGS.rnn_layers > 1:
+#         cell = tf.contrib.rnn.MultiRNNCell([create_rnn_cell() for _ in range(FLAGS.rnn_layers)], state_is_tuple=True)
+#     else:
+#         cell = create_rnn_cell()
+#     
+#     initial_rnn_state = cell.zero_state(batch_size, dtype=tf.float32)
+#     output, final_state = tf.nn.dynamic_rnn(cell,
+#                                             rnn_inputs,
+#                                             dtype=tf.float32,
+#                                             sequence_length=seqlen,
+#                                             initial_state=initial_rnn_state)
     
-    output, final_state = tf.nn.dynamic_rnn(cell,
-                                            rnn_inputs,
-                                            dtype=tf.float32,
-                                            sequence_length=seqlen,
-                                            initial_state=initial_rnn_state)
-        
+    ##### OR USE SONNET.....  ####
+    
+    multi_lstm = sm.MultiLSTM(rnn_size=FLAGS.rnn_dim,
+                              num_layers=FLAGS.rnn_layers,
+                              batch_size=FLAGS.batch_size,
+                              dropout=FLAGS.dropout,
+                              use_skip_connections=FLAGS.skip_connections,
+                              use_peepholes=FLAGS.peepholes)
+    output, final_state = multi_lstm(rnn_inputs)
+    keep_prob = multi_lstm.keep_prob
+    seqlen = multi_lstm.seq_len
+    
+    
     #############################################################################################
     
     ''' RNN POOLING? '''
@@ -154,11 +168,12 @@ with tf.variable_scope("model", initializer=tf.truncated_normal_initializer(seed
     #############################################################################################
     
     ''' DENSE LAYER '''
+    dim = output.get_shape().as_list()[-1]
     init_bias = 0.0
     if FLAGS.mean_pool:
         init_bias = batcher.ymean; print('Y-MEAN == {}'.format(init_bias))
     with tf.variable_scope('s1'):
-        W = tf.get_variable('W', [FLAGS.rnn_dim, 1])
+        W = tf.get_variable('W', [dim, 1])
         b = tf.get_variable('b', [1], initializer=tf.constant_initializer(init_bias))
     output = tf.matmul(output, W) + b
     

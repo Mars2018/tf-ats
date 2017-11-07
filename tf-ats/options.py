@@ -43,9 +43,12 @@ def get_parser(default_config=None):
     
     p.add("--max_grad_norm", type=float, default=5.0, required=False, help="")
     p.add("--optimizer", type=str, default='adam', required=False, help="optimizer")
-    p.add("--mean_pool", action='store_true', help="")
     p.add("--valid_cut", type=float, default=0.1, required=False, help="")
     p.add("--num_highway_layers", type=int, default=0, help="Number of highway layers")
+    
+    p.add("--mean_pool", action='store_true', help="")
+    p.add("--skip_connections", action='store_true', help="")
+    p.add("--peepholes", action='store_true', help="")
     
     ## dsv
     p.add("--min_word_count", type=int, default=2, help="Min word frequency")
