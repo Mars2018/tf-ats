@@ -7,6 +7,7 @@ import sys
 import time
 import argparse
 import pprint
+from timeit import default_timer as timer
 import pickle as pk
 import numpy as np
 import tensorflow as tf
@@ -55,6 +56,7 @@ argv=[]# override config file here
 #argv.append('--seed'); argv.append('289681027')
 FLAGS = config.get_config(parser=parser, config_file=config_file, argv=argv)
 FLAGS.chkpt_dir = make_abs(FLAGS.chkpt_dir)
+FLAGS.rand_seed = U.seed_random(FLAGS.rand_seed)
 pprint.pprint(FLAGS)
 
 ''' setup checkpoint directory '''
@@ -64,8 +66,7 @@ if not os.path.exists(FLAGS.chkpt_dir):
 config.save_local_config(FLAGS)
 
 ''' random seed '''
-rand_seed = U.seed_random(FLAGS.rand_seed)
-rng = np.random.RandomState(rand_seed)
+# rng = np.random.RandomState(FLAGS.rand_seed)
 
 #mode = FLAGS.run_mode
 batch_size = FLAGS.batch_size
@@ -78,13 +79,30 @@ embed_matrix, word_vocab = Vocab.load_word_embeddings(embed_file, essay_file, mi
 print(embed_matrix.shape)
 
 ''' create essay reader, parser, & batcher '''
-reader =  GlobReader(essay_file, chunk_size=10000, regex=REGEX_NUM, shuf=True)
+reader =  GlobReader(essay_file, chunk_size=10000, regex=REGEX_NUM, shuf=True, rng=U.rng)
 text_parser = TextParser(word_vocab=word_vocab)
 
 fields = {0:'id', 1:'label', -1:text_parser}
 field_parser = FieldParser(fields, reader=reader)
     
 batcher = EssayBatcher(reader=field_parser, batch_size=batch_size, trim_words=True)
+
+T={}
+def tic(K=0):
+    global T
+    if isinstance(K,list):
+        for k in K:
+            tic(k)
+    else:
+        T[K]=timer()
+def toc(K=0, reset=True):
+    global T
+    t=timer()
+    tt=t-T[K]
+    if reset:
+        T[K]=t
+    return tt
+
 
 ###############################
 '''
@@ -97,7 +115,11 @@ https://danijar.com/variable-sequence-lengths-in-tensorflow/
 ####################
 
 ''' DEFINE REGRESSION MODEL '''
-with tf.variable_scope("model", initializer=tf.truncated_normal_initializer(seed=rand_seed, stddev=0.05, dtype=tf.float32)) as scope:
+with tf.variable_scope("model", 
+                       initializer=tf.truncated_normal_initializer(seed=FLAGS.rand_seed, 
+                                                                   stddev=0.05, 
+                                                                   dtype=tf.float32)
+                       ) as scope:
 
     ''' PLACEHOLDERS '''
     inputs = tf.placeholder(tf.int32,
@@ -108,16 +130,16 @@ with tf.variable_scope("model", initializer=tf.truncated_normal_initializer(seed
                              shape=[batch_size, 1],
                              name="targets")
     
-    seqlen = tf.placeholder(tf.int32, [batch_size])
-    
-    
     ''' EMBEDDING LAYER '''
+    #with tf.device("/cpu:0"):
     E = tf.get_variable(name="E", shape=embed_matrix.shape, initializer=tf.constant_initializer(embed_matrix), trainable=True)# TRUE/FALSE ???
     rnn_inputs = tf.nn.embedding_lookup(E, inputs)
     
     
     ####################################################################################
-    ''' BUILD RNN '''
+    
+#     ''' BUILD RNN '''
+#     seqlen = tf.placeholder(tf.int32, [batch_size])
 #     keep_prob = tf.placeholder_with_default(1.0, shape=())
 #     def create_rnn_cell():
 #         cell = tf.contrib.rnn.BasicLSTMCell(FLAGS.rnn_dim, state_is_tuple=True, forget_bias=0.0, reuse=False)
@@ -126,12 +148,12 @@ with tf.variable_scope("model", initializer=tf.truncated_normal_initializer(seed
 #         ## dropout ##
 #         cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=keep_prob)#==1.-FLAGS.dropout
 #         return cell
-#             
+#              
 #     if FLAGS.rnn_layers > 1:
 #         cell = tf.contrib.rnn.MultiRNNCell([create_rnn_cell() for _ in range(FLAGS.rnn_layers)], state_is_tuple=True)
 #     else:
 #         cell = create_rnn_cell()
-#     
+#      
 #     initial_rnn_state = cell.zero_state(batch_size, dtype=tf.float32)
 #     output, final_state = tf.nn.dynamic_rnn(cell,
 #                                             rnn_inputs,
@@ -170,8 +192,10 @@ with tf.variable_scope("model", initializer=tf.truncated_normal_initializer(seed
     ''' DENSE LAYER '''
     dim = output.get_shape().as_list()[-1]
     init_bias = 0.0
-    if FLAGS.mean_pool:
-        init_bias = batcher.ymean; print('Y-MEAN == {}'.format(init_bias))
+    
+#     if FLAGS.mean_pool:
+#         init_bias = batcher.ymean; print('Y-MEAN == {}'.format(init_bias))
+        
     with tf.variable_scope('s1'):
         W = tf.get_variable('W', [dim, 1])
         b = tf.get_variable('b', [1], initializer=tf.constant_initializer(init_bias))
@@ -180,11 +204,12 @@ with tf.variable_scope("model", initializer=tf.truncated_normal_initializer(seed
     #############################################################################################
     
     ''' OUTPUT ACTIVATION (sigmoid?  tanh?) ''' 
-    if FLAGS.mean_pool:
-        preds = tf.nn.tanh(output)
-    else:
-        preds = tf.nn.sigmoid(output)
-        
+    preds = tf.nn.tanh(output)
+#     if FLAGS.mean_pool:
+#         preds = tf.nn.tanh(output)
+#     else:
+#         preds = tf.nn.sigmoid(output)
+    
     #############################################################################################
     
     ''' LOSS FUNCTION (MSE) '''
@@ -228,7 +253,7 @@ with tf.variable_scope("model", initializer=tf.truncated_normal_initializer(seed
 
 ''' TRAINING SESSION '''
 with tf.Session() as sess:
-    tf.set_random_seed(rand_seed)
+    tf.set_random_seed(FLAGS.rand_seed)
     tf.global_variables_initializer().run()
     
     valid_batches, valid_ids = [],None
@@ -236,10 +261,10 @@ with tf.Session() as sess:
     epoch=0
     while epoch < epochs:
         epoch += 1
-        
+        tic()
         losses, qwks = [],[]
         for b in batcher.batch_stream(stop=True, skip_ids=valid_ids):
-            if epoch==1 and rng.rand()<FLAGS.valid_cut:
+            if epoch==1 and U.rng.rand()<FLAGS.valid_cut:
                 valid_batches.append(b)
                 continue
             
@@ -250,16 +275,25 @@ with tf.Session() as sess:
             
             losses.append(loss)
             qwks.append(kappa)
-            sys.stdout.write('  loss={0:0.4}'.format(loss))
-            sys.stdout.write('|qwk={0:0.4}'.format(kappa))
+            word_count = batcher.word_count(reset=False)
+            sec = toc(reset=False)
+            wps = int(word_count/sec)
+            sys.stdout.write('  qwk={0:0.3g}'.format(kappa))
+            sys.stdout.write('|loss={0:0.3g}'.format(loss))
+            sys.stdout.write('|wps={0}'.format(wps))
             sys.stdout.flush()
-        
+            
         if epoch==1:
             valid_ids = set([id for b in valid_batches for id in b.ids])
             print('\n{} VALID-BATCHES ({} VALID-IDS)'.format(len(valid_batches),len(valid_ids)))
-            
+            #vid=list(valid_ids); vid.sort(); print(vid)
+        
+        word_count = batcher.word_count()
+        sec = toc()
+        wps = int(word_count/sec)
+        
         print('')
-        print('Epoch {0}\tMean TRAIN Loss : {1:0.4}\tMean TRAIN Kappa : {2:0.4}\n'.format(epoch, np.mean(losses), np.mean(qwks)))
+        print('\nEpoch {0}\tTRAIN Loss : {1:0.4}\tTRAIN Kappa : {2:0.4}\t{3:0.2g}secs|{4}wps\n'.format(epoch, np.mean(losses), np.mean(qwks), sec, wps))
         
         ''' VALIDATION '''
         losses, qwks = [],[]
@@ -272,7 +306,7 @@ with tf.Session() as sess:
             sys.stdout.write('|qwk={0:0.4}\n'.format(kappa))
             sys.stdout.flush()
         print('')
-        print('Epoch {0}\tMean VALID Loss : {1:0.4}\tMean VALID Kappa : {2:0.4}\n'.format(epoch, np.mean(losses), np.mean(qwks)))
+        print('Epoch {0}\tVALID Loss : {1:0.4}\tVALID Kappa : {2:0.4}\n'.format(epoch, np.mean(losses), np.mean(qwks)))
 
 
 
