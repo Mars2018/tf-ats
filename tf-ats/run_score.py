@@ -82,7 +82,7 @@ print(embed_matrix.shape)
 reader =  GlobReader(essay_file, chunk_size=10000, regex=REGEX_NUM, shuf=True, rng=U.rng)
 text_parser = TextParser(word_vocab=word_vocab)
 
-fields = {0:'id', 1:'label', -1:text_parser}
+fields = {0:'id', 1:'y', -1:text_parser}
 field_parser = FieldParser(fields, reader=reader)
     
 batcher = EssayBatcher(reader=field_parser, batch_size=batch_size, trim_words=True)
