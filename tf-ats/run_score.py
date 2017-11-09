@@ -138,41 +138,21 @@ with tf.variable_scope("model",
     
     ####################################################################################
     
-#     ''' BUILD RNN '''
-#     seqlen = tf.placeholder(tf.int32, [batch_size])
-#     keep_prob = tf.placeholder_with_default(1.0, shape=())
-#     def create_rnn_cell():
-#         cell = tf.contrib.rnn.BasicLSTMCell(FLAGS.rnn_dim, state_is_tuple=True, forget_bias=0.0, reuse=False)
-#         #cell = tf.nn.rnn_cell.LSTMCell(FLAGS.rnn_dim, state_is_tuple=True, forget_bias=0.0, reuse=False, use_peepholes=True)
-#         #############
-#         ## dropout ##
-#         cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=keep_prob)#==1.-FLAGS.dropout
-#         return cell
-#              
-#     if FLAGS.rnn_layers > 1:
-#         cell = tf.contrib.rnn.MultiRNNCell([create_rnn_cell() for _ in range(FLAGS.rnn_layers)], state_is_tuple=True)
-#     else:
-#         cell = create_rnn_cell()
-#      
-#     initial_rnn_state = cell.zero_state(batch_size, dtype=tf.float32)
-#     output, final_state = tf.nn.dynamic_rnn(cell,
-#                                             rnn_inputs,
-#                                             dtype=tf.float32,
-#                                             sequence_length=seqlen,
-#                                             initial_state=initial_rnn_state)
+    RNN = sm.MultiLSTM
+    if FLAGS.bidirectional:
+        RNN = sm.BiMultiLSTM
     
-    ##### OR USE SONNET.....  ####
+    rnn = RNN(rnn_size=FLAGS.rnn_dim,
+              num_layers=FLAGS.rnn_layers,
+              batch_size=FLAGS.batch_size,
+              dropout=FLAGS.dropout,
+#               use_skip_connections=FLAGS.skip_connections,
+#               use_peepholes=FLAGS.peepholes
+              )
     
-    multi_lstm = sm.MultiLSTM(rnn_size=FLAGS.rnn_dim,
-                              num_layers=FLAGS.rnn_layers,
-                              batch_size=FLAGS.batch_size,
-                              dropout=FLAGS.dropout,
-                              use_skip_connections=FLAGS.skip_connections,
-                              use_peepholes=FLAGS.peepholes)
-    output, final_state = multi_lstm(rnn_inputs)
-    keep_prob = multi_lstm.keep_prob
-    seqlen = multi_lstm.seq_len
-    
+    output, final_state = rnn(rnn_inputs)
+    keep_prob = rnn.keep_prob
+    seq_len = rnn.seq_len
     
     #############################################################################################
     
@@ -180,7 +160,7 @@ with tf.variable_scope("model",
     if FLAGS.mean_pool: ## use mean pooled rnn states
         output = tf.reduce_mean(output, axis=1)
     else: ## use final rnn state
-        output = tf.gather_nd(output, tf.stack([tf.range(batch_size), seqlen-1], axis=1))
+        output = tf.gather_nd(output, tf.stack([tf.range(batch_size), seq_len-1], axis=1))
         
     #############################################################################################
     
@@ -216,10 +196,16 @@ with tf.variable_scope("model",
     train_loss = tf.losses.mean_squared_error(targets, preds)
     train_qwk = qwk(targets, preds)
     
-    
     ''' TRAIN STEP '''
     tvars = tf.trainable_variables()
+    
+    ## original ##
     grads, global_norm = tf.clip_by_global_norm(tf.gradients(train_loss, tvars), FLAGS.max_grad_norm)
+    
+    ## experimental ##
+    #mu = tf.cast(tf.reduce_mean(seq_len), tf.float32)
+    #grads, global_norm = tf.clip_by_global_norm(tf.gradients(train_loss * mu, tvars), FLAGS.max_grad_norm)
+    #grads, global_norm = tf.clip_by_global_norm( [mu * x for x in tf.gradients(train_loss, tvars)], FLAGS.max_grad_norm)
     
     learning_rate = tf.get_variable(
         "learning_rate",
@@ -268,9 +254,11 @@ with tf.Session() as sess:
                 valid_batches.append(b)
                 continue
             
-            feed_dict = { inputs: b.w, targets: b.y, seqlen: b.s, keep_prob: 1.0-FLAGS.dropout }
+            feed_dict = { inputs: b.w, targets: b.y, seq_len: b.s, keep_prob: 1.0-FLAGS.dropout } #feed_dict[rnn.is_training]=True
+            
+            fetches = [train_loss, train_step, train_qwk]
             loss, _, kappa = sess.run(
-                [train_loss, train_step, train_qwk],
+                fetches,
                 feed_dict)
             
             losses.append(loss)
@@ -293,12 +281,13 @@ with tf.Session() as sess:
         wps = int(word_count/sec)
         
         print('')
-        print('\nEpoch {0}\tTRAIN Loss : {1:0.4}\tTRAIN Kappa : {2:0.4}\t{3:0.2g}secs|{4}wps\n'.format(epoch, np.mean(losses), np.mean(qwks), sec, wps))
+        print('\nEpoch {0}\tTRAIN Loss : {1:0.4}\tTRAIN Kappa : {2:0.4}\t{3:0.2g}sec|{4}wps\n'.format(epoch, np.mean(losses), np.mean(qwks), sec, wps))
         
         ''' VALIDATION '''
         losses, qwks = [],[]
         for b in valid_batches:
-            feed_dict = { inputs: b.w, targets: b.y, seqlen: b.s, keep_prob: 1.0 }
+            feed_dict = { inputs: b.w, targets: b.y, seq_len: b.s, keep_prob: 1.0 }
+            #feed_dict[rnn.is_training]=False
             loss, kappa = sess.run( [train_loss, train_qwk], feed_dict)
             losses.append(loss)
             qwks.append(kappa)
@@ -311,10 +300,34 @@ with tf.Session() as sess:
 
 
 ###############################################################################################################################
+######### OLD STUFF ##############################
 
+#     ''' BUILD RNN '''
+#     seq_len = tf.placeholder(tf.int32, [batch_size])
+#     keep_prob = tf.placeholder_with_default(1.0, shape=())
+#     def create_rnn_cell():
+#         cell = tf.contrib.rnn.BasicLSTMCell(FLAGS.rnn_dim, state_is_tuple=True, forget_bias=0.0, reuse=False)
+#         #cell = tf.nn.rnn_cell.LSTMCell(FLAGS.rnn_dim, state_is_tuple=True, forget_bias=0.0, reuse=False, use_peepholes=True)
+#         #############
+#         ## dropout ##
+#         cell = tf.contrib.rnn.DropoutWrapper(cell, output_keep_prob=keep_prob)#==1.-FLAGS.dropout
+#         return cell
+#              
+#     if FLAGS.rnn_layers > 1:
+#         cell = tf.contrib.rnn.MultiRNNCell([create_rnn_cell() for _ in range(FLAGS.rnn_layers)], state_is_tuple=True)
+#     else:
+#         cell = create_rnn_cell()
+#      
+#     initial_rnn_state = cell.zero_state(batch_size, dtype=tf.float32)
+#     output, final_state = tf.nn.dynamic_rnn(cell,
+#                                             rnn_inputs,
+#                                             dtype=tf.float32,
+#                                             sequence_length=seq_len,
+#                                             initial_state=initial_rnn_state)
+##############################
 #     def length(sequence):
 #         used = tf.sign(tf.reduce_max(tf.abs(sequence), 2))
 #         length = tf.reduce_sum(used, 1)
 #         length = tf.cast(length, tf.int32)
 #         return length
-#     seqlen = length(rnn_inputs)
+#     seq_len = length(rnn_inputs)
