@@ -7,47 +7,23 @@ import sys
 import time
 import argparse
 import pprint
-from timeit import default_timer as timer
 import pickle as pk
 import numpy as np
 import tensorflow as tf
+import sonnet as snt
 
 from nlp.util import config
 from nlp.util import utils as U
+from nlp.util.utils import tic, toc, qwk, make_abs
 
 from nlp.readers.vocab import Vocab
 from nlp.readers.text_reader import GlobReader, TextParser, FieldParser, EssayBatcher, REGEX_NUM
 
-from model import highway, linear
-import sonnet_modules as sm
-
 import options
+from attention import attention
+import nlp.tf_tools.sonnet_modules as sm
+#import LM_sonnet_modules as lm
 
-def dot(x,y):
-    x = tf.transpose(x)
-    #y = tf.transpose(y)
-    return tf.matmul(x,y)
-
-#     def kappa(t,p):
-#         mt = tf.reduce_mean(t)
-#         u = 0.5 * tf.reduce_sum(tf.squared_difference(t, p))
-#         v = tf.tensordot(p, t - tf.reduce_mean(t))
-#         return v / (v + u)
-
-def qwk(t,p):
-    mt = tf.reduce_mean(t)
-    mp = tf.reduce_mean(p)
-    N = tf.cast(tf.shape(t)[0], tf.float32)
-    k = 2. * N * mt * mp
-    u = 2. *dot(t,p) - k
-    v = dot(t,t) + dot(p,p) - k
-    return tf.squeeze(u / v)
-
-def qwk_loss(t,p):
-    return 1. - qwk(t,p)
-
-def make_abs(path):
-    return os.path.abspath(path)
 
 ''' get config '''    
 parser = options.get_parser()
@@ -64,9 +40,6 @@ if not os.path.exists(FLAGS.chkpt_dir):
     U.mkdirs(FLAGS.chkpt_dir)
     print('Created checkpoint directory', FLAGS.chkpt_dir)
 config.save_local_config(FLAGS)
-
-''' random seed '''
-# rng = np.random.RandomState(FLAGS.rand_seed)
 
 #mode = FLAGS.run_mode
 batch_size = FLAGS.batch_size
@@ -85,24 +58,13 @@ text_parser = TextParser(word_vocab=word_vocab)
 fields = {0:'id', 1:'y', -1:text_parser}
 field_parser = FieldParser(fields, reader=reader)
     
-batcher = EssayBatcher(reader=field_parser, batch_size=batch_size, trim_words=True)
+#batcher = EssayBatcher(reader=field_parser, batch_size=batch_size, trim_words=True)
+#batcher = EssayBatcher(reader=field_parser, batch_size=batch_size, max_text_length=FLAGS.max_text_length)
 
-T={}
-def tic(K=0):
-    global T
-    if isinstance(K,list):
-        for k in K:
-            tic(k)
-    else:
-        T[K]=timer()
-def toc(K=0, reset=True):
-    global T
-    t=timer()
-    tt=t-T[K]
-    if reset:
-        T[K]=t
-    return tt
-
+batcher = EssayBatcher(reader=field_parser,
+                       batch_size=FLAGS.batch_size,
+                       max_text_length=FLAGS.max_text_length, 
+                       trim_words=FLAGS.trim_words)
 
 ###############################
 '''
@@ -115,7 +77,7 @@ https://danijar.com/variable-sequence-lengths-in-tensorflow/
 ####################
 
 ''' DEFINE REGRESSION MODEL '''
-with tf.variable_scope("model", 
+with tf.variable_scope("Model", 
                        initializer=tf.truncated_normal_initializer(seed=FLAGS.rand_seed, 
                                                                    stddev=0.05, 
                                                                    dtype=tf.float32)
@@ -131,51 +93,53 @@ with tf.variable_scope("model",
                              name="targets")
     
     ''' EMBEDDING LAYER '''
-    #with tf.device("/cpu:0"):
-    E = tf.get_variable(name="E", shape=embed_matrix.shape, initializer=tf.constant_initializer(embed_matrix), trainable=True)# TRUE/FALSE ???
-    rnn_inputs = tf.nn.embedding_lookup(E, inputs)
-    
+    ## OLD ##
+    #E = tf.get_variable(name="E", shape=embed_matrix.shape, initializer=tf.constant_initializer(embed_matrix), trainable=True)# TRUE/FALSE ???
+    #rnn_inputs = tf.nn.embedding_lookup(E, inputs)
+    ## SONNET ##
+    embed_module = snt.Embed(existing_vocab=embed_matrix, trainable=True)
+    rnn_inputs = embed_module(inputs)
     
     ####################################################################################
     
-    RNN = sm.MultiLSTM
+    RNN = sm.DeepRNN#sm.MultiLSTM
     if FLAGS.bidirectional:
-        RNN = sm.BiMultiLSTM
+        RNN = sm.DeepBiRNN#sm.BiMultiLSTM
     
     rnn = RNN(rnn_size=FLAGS.rnn_dim,
               num_layers=FLAGS.rnn_layers,
               batch_size=FLAGS.batch_size,
               dropout=FLAGS.dropout,
+              train_initial_state=FLAGS.train_initial_state,
+              unit=FLAGS.rnn_unit,
 #               use_skip_connections=FLAGS.skip_connections,
 #               use_peepholes=FLAGS.peepholes
               )
-    
-    output, final_state = rnn(rnn_inputs)
+    rnn_output, final_state = rnn(rnn_inputs)
     keep_prob = rnn.keep_prob
     seq_len = rnn.seq_len
+    dim = rnn_output.get_shape().as_list()[-1]
     
     #############################################################################################
     
-    ''' RNN POOLING? '''
-    if FLAGS.mean_pool: ## use mean pooled rnn states
-        output = tf.reduce_mean(output, axis=1)
-    else: ## use final rnn state
-        output = tf.gather_nd(output, tf.stack([tf.range(batch_size), seq_len-1], axis=1))
+    ''' RNN AGGREGATION? '''
+    if FLAGS.att_size>0:
+        output, alphas = attention(rnn_output, FLAGS.att_size, return_alphas=True)
+    elif FLAGS.mean_pool: ## use mean pooled rnn states
+        output = tf.reduce_mean(rnn_output, axis=1)
+    else: ## otherwise just use final rnn state
+        output = tf.gather_nd(rnn_output, tf.stack([tf.range(batch_size), seq_len-1], axis=1))
+    
+    ## final dropout layer (??) ##
+    if FLAGS.dropout>0:
+        drop = sm.Dropout(keep_prob)
+        output = drop(output)
         
-    #############################################################################################
-    
-#     if FLAGS.num_highway_layers > 0:
-#         output = highway(output, output.get_shape()[-1], num_layers=FLAGS.num_highway_layers)# tf.shape(output)[-1] # output.get_shape()[-1]
-    
     #############################################################################################
     
     ''' DENSE LAYER '''
-    dim = output.get_shape().as_list()[-1]
+    #dim = output.get_shape().as_list()[-1]
     init_bias = 0.0
-    
-#     if FLAGS.mean_pool:
-#         init_bias = batcher.ymean; print('Y-MEAN == {}'.format(init_bias))
-        
     with tf.variable_scope('s1'):
         W = tf.get_variable('W', [dim, 1])
         b = tf.get_variable('b', [1], initializer=tf.constant_initializer(init_bias))
@@ -185,27 +149,13 @@ with tf.variable_scope("model",
     
     ''' OUTPUT ACTIVATION (sigmoid?  tanh?) ''' 
     preds = tf.nn.tanh(output)
-#     if FLAGS.mean_pool:
-#         preds = tf.nn.tanh(output)
-#     else:
-#         preds = tf.nn.sigmoid(output)
+#     preds = tf.nn.sigmoid(output)
     
     #############################################################################################
     
     ''' LOSS FUNCTION (MSE) '''
     train_loss = tf.losses.mean_squared_error(targets, preds)
     train_qwk = qwk(targets, preds)
-    
-    ''' TRAIN STEP '''
-    tvars = tf.trainable_variables()
-    
-    ## original ##
-    grads, global_norm = tf.clip_by_global_norm(tf.gradients(train_loss, tvars), FLAGS.max_grad_norm)
-    
-    ## experimental ##
-    #mu = tf.cast(tf.reduce_mean(seq_len), tf.float32)
-    #grads, global_norm = tf.clip_by_global_norm(tf.gradients(train_loss * mu, tvars), FLAGS.max_grad_norm)
-    #grads, global_norm = tf.clip_by_global_norm( [mu * x for x in tf.gradients(train_loss, tvars)], FLAGS.max_grad_norm)
     
     learning_rate = tf.get_variable(
         "learning_rate",
@@ -222,18 +172,23 @@ with tf.variable_scope("model",
         trainable=False,
         collections=[tf.GraphKeys.GLOBAL_VARIABLES, tf.GraphKeys.GLOBAL_STEP])
     
+    ''' TRAIN OPS '''
     if FLAGS.optimizer == 'adam':
         opt = tf.train.AdamOptimizer
     elif FLAGS.optimizer == 'rmsprop':
         opt = tf.train.RMSPropOptimizer
     else:
         opt = tf.train.GradientDescentOptimizer
-        
     optimizer = opt(learning_rate)
-    train_step = optimizer.apply_gradients(zip(grads, tvars), global_step=global_step)
-    
-    #train_step = tf.train.AdamOptimizer(FLAGS.learning_rate).minimize(train_loss)
-    #train_step = tf.train.RMSPropOptimizer(FLAGS.learning_rate).minimize(train_loss)
+
+    tvars = tf.trainable_variables(); [print(var) for var in tvars]
+    grads, global_norm = tf.clip_by_global_norm(tf.gradients(train_loss, tvars), FLAGS.max_grad_norm)
+    train_op = optimizer.apply_gradients(zip(grads, tvars), global_step=global_step)
+
+    ## experimental ##
+    #mu = tf.cast(tf.reduce_mean(seq_len), tf.float32)
+    #grads, global_norm = tf.clip_by_global_norm(tf.gradients(train_loss * mu, tvars), FLAGS.max_grad_norm)
+    #grads, global_norm = tf.clip_by_global_norm( [mu * x for x in tf.gradients(train_loss, tvars)], FLAGS.max_grad_norm)
     
 ############################################################################
 
@@ -248,16 +203,17 @@ with tf.Session() as sess:
     while epoch < epochs:
         epoch += 1
         tic()
-        losses, qwks = [],[]
-        for b in batcher.batch_stream(stop=True, skip_ids=valid_ids):
+        losses, qwks, P, Y, batch = [],[],[],[],0
+        for b in batcher.batch_stream(stop=True, skip_ids=valid_ids, w=True, c=False):
+            batch+=1
             if epoch==1 and U.rng.rand()<FLAGS.valid_cut:
                 valid_batches.append(b)
                 continue
             
-            feed_dict = { inputs: b.w, targets: b.y, seq_len: b.s, keep_prob: 1.0-FLAGS.dropout } #feed_dict[rnn.is_training]=True
+            feed_dict = { inputs: b.w, targets: b.y, seq_len: b.s, keep_prob: 1.0-FLAGS.dropout }
+            fetches = [train_loss, train_op, train_qwk, preds]
             
-            fetches = [train_loss, train_step, train_qwk]
-            loss, _, kappa = sess.run(
+            loss, _, kappa, p = sess.run(
                 fetches,
                 feed_dict)
             
@@ -266,36 +222,45 @@ with tf.Session() as sess:
             word_count = batcher.word_count(reset=False)
             sec = toc(reset=False)
             wps = int(word_count/sec)
-            sys.stdout.write('  qwk={0:0.3g}'.format(kappa))
-            sys.stdout.write('|loss={0:0.3g}'.format(loss))
-            sys.stdout.write('|wps={0}'.format(wps))
-            sys.stdout.flush()
+            P.extend(np.squeeze(p)); Y.extend(np.squeeze(b.y)); kappa = U.nkappa(Y,P)
+            
+            if batch % FLAGS.print_every == 0:
+                sys.stdout.write('\tqwk={0:0.3g}'.format(kappa))
+                sys.stdout.write('|mse={0:0.3g}'.format(loss))
+                sys.stdout.write('|wps={0}'.format(wps))
+                sys.stdout.flush()
             
         if epoch==1:
-            valid_ids = set([id for b in valid_batches for id in b.ids])
+            valid_ids = set([id for b in valid_batches for id in b.id])
             print('\n{} VALID-BATCHES ({} VALID-IDS)'.format(len(valid_batches),len(valid_ids)))
             #vid=list(valid_ids); vid.sort(); print(vid)
         
         word_count = batcher.word_count()
         sec = toc()
         wps = int(word_count/sec)
+        QWK = U.nkappa(Y,P)#QWK = np.mean(qwks)
         
         print('')
-        print('\nEpoch {0}\tTRAIN Loss : {1:0.4}\tTRAIN Kappa : {2:0.4}\t{3:0.2g}sec|{4}wps\n'.format(epoch, np.mean(losses), np.mean(qwks), sec, wps))
+        print('\nEpoch {0}\tTRAIN Loss : {1:0.4}\tTRAIN Kappa : {2:0.4}\t{3:0.2g}min|{4}wps\n'.format(epoch, np.mean(losses), QWK, float(sec)/60., wps))
         
         ''' VALIDATION '''
-        losses, qwks = [],[]
+        losses, qwks, P, Y, batch = [],[],[],[],0
         for b in valid_batches:
+            batch+=1
             feed_dict = { inputs: b.w, targets: b.y, seq_len: b.s, keep_prob: 1.0 }
-            #feed_dict[rnn.is_training]=False
-            loss, kappa = sess.run( [train_loss, train_qwk], feed_dict)
+            loss, kappa, p = sess.run( [train_loss, train_qwk, preds], feed_dict)
             losses.append(loss)
             qwks.append(kappa)
-            sys.stdout.write('  loss={0:0.4}'.format(loss))
-            sys.stdout.write('|qwk={0:0.4}\n'.format(kappa))
-            sys.stdout.flush()
+            P.extend(np.squeeze(p)); Y.extend(np.squeeze(b.y)); kappa = U.nkappa(Y,P)
+            
+            if batch % FLAGS.print_every == 0:
+                sys.stdout.write('\tmse={0:0.4}'.format(loss))
+                sys.stdout.write('|qwk={0:0.4}\n'.format(kappa))
+                sys.stdout.flush()
+                
+        QWK = U.nkappa(Y,P)#QWK = np.mean(qwks)
         print('')
-        print('Epoch {0}\tVALID Loss : {1:0.4}\tVALID Kappa : {2:0.4}\n'.format(epoch, np.mean(losses), np.mean(qwks)))
+        print('Epoch {0}\tVALID Loss : {1:0.4}\tVALID Kappa : {2:0.4}\n'.format(epoch, np.mean(losses), QWK))
 
 
 

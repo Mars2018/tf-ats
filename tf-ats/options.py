@@ -16,6 +16,7 @@ def get_parser(default_config=None):
     p.add("--data_dir", type=str, required=False, help="The path to the data directory")
     p.add("--chkpt_dir", type=str, required=False, help="The path to the checkpoint directory")
     
+    p.add("--vocab_file", type=str, required=False, help="The path to the vocab file")
     p.add("--embed_path", type=str, required=False, help="The path to the glove embeddings")
     p.add("-e", "--embed_dim", type=int, default=50, help="Embeddings dimension (default=50)")
     p.add("--min_word_count", type=int, default=2, help="Min word frequency")
@@ -32,12 +33,25 @@ def get_parser(default_config=None):
     p.add("-u", "--rnn_unit", type=str, default='lstm', help="Recurrent unit type (lstm|gru|simple) (default=lstm)")
     p.add("-rl","--rnn_layers", type=int, default=2, help='number of layers in the LSTM')#2
     p.add("--bidirectional", action='store_true', help="")
+    p.add("--train_initial_state", action='store_true', help="")
 
+    p.add("--char_embed_size", type=int, metavar='<int>', default=15, help='dimensionality of character embeddings')
+    p.add("-kw", "--kernel_widths", type=str, metavar='<str>', default='[1,2,3,4,5,6,7]', help="")
+    p.add("-kf", "--kernel_features", type=str, metavar='<str>', default='[50,100,150,200,200,200,200]', help="")
+    p.add("--char_embed_chkpt", type=str, metavar='<str>', default=None, help="")
+
+    p.add("--trim_words", action='store_true', help="")
+    p.add("--trim_chars", action='store_true', help="")
     p.add("--mean_pool", action='store_true', help="")
     p.add("--skip_connections", action='store_true', help="")
     p.add("--peepholes", action='store_true', help="")
     
+    p.add("--num_highway_layers", type=int, default=0, help="Number of highway layers")
+    p.add("--max_text_length", type=int, default=None, help="Max words in essay to consider")
+    p.add("--att_size", type=int, default=0, help="attention layer size")
+    
     p.add("--rand_seed", type=int, default=0, help="")
+    p.add("--print_every", type=int, default=10, help="")
     
     
 #     p.add("--maxlen", type=int, default=0, help="Maximum allowed number of words during training. '0' means no limit (default=0)")
