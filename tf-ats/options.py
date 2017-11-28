@@ -27,7 +27,9 @@ def get_parser(default_config=None):
     p.add("--max_grad_norm", type=float, default=1000.0, required=False, help="")
     p.add("--epochs", type=int, default=100, help="Number of epochs (default=50)")
     p.add("--optimizer", type=str, default='adam', required=False, help="optimizer")
-    p.add("--valid_cut", type=float, default=0.1, required=False, help="")
+    p.add("--valid_cut", type=float, default=0.2, required=False, help="")
+    
+    p.add("--min_cut", type=float, default=1.0, required=False, help="")
     
     p.add("-r", "--rnn_dim", type=int, default=300, help="RNN dimension. '0' means no RNN layer (default=300)")
     p.add("-u", "--rnn_unit", type=str, default='lstm', help="Recurrent unit type (lstm|gru|simple) (default=lstm)")

@@ -2,6 +2,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+# python -u train.py | tee chkpt/mod/log.txt
+
 import os
 import sys
 import time
@@ -24,12 +26,11 @@ from nlp.readers.text_reader import GlobReader, TextParser, FieldParser, EssayBa
 from nlp.tf_tools.attention import attention
 import nlp.tf_tools.sonnet_modules as sm
 
-
 ''' get config '''    
 parser = options.get_parser()
 config_file = 'config/ats.conf'
 argv=[]# override config file here
-#argv.append('--seed'); argv.append('289681027')
+
 FLAGS = config.get_config(parser=parser, config_file=config_file, argv=argv)
 FLAGS.chkpt_dir = make_abs(FLAGS.chkpt_dir)
 FLAGS.rand_seed = U.seed_random(FLAGS.rand_seed)
@@ -56,21 +57,18 @@ if embed.word:
     ''' load Glove word embeddings, along with word vocab '''
     embed_file = FLAGS.embed_path.format(FLAGS.embed_dim)
     embed_matrix, word_vocab = Vocab.load_word_embeddings(embed_file, essay_file, min_freq=FLAGS.min_word_count)
-    max_word_length=None
+    char_vocab, max_word_length = None, None
     #print(embed_matrix.shape)
 else:
     vocab_file = os.path.join(FLAGS.data_dir, FLAGS.vocab_file)
     word_vocab, char_vocab, max_word_length = Vocab.load_vocab(vocab_file)
 
 ''' create essay reader, parser, & batcher '''
-reader =  GlobReader(essay_file, chunk_size=10000, regex=REGEX_NUM, shuf=True, rng=U.rng)
-if embed.word:
-    text_parser = TextParser(word_vocab=word_vocab)
-else:
-    text_parser = TextParser(word_vocab=word_vocab, char_vocab=char_vocab, max_word_length=max_word_length)
+reader =  GlobReader(essay_file, chunk_size=10000, regex=REGEX_NUM, shuf=True, seed=FLAGS.rand_seed)
+text_parser = TextParser(word_vocab=word_vocab, char_vocab=char_vocab, max_word_length=max_word_length)
 
 fields = {0:'id', 1:'y', -1:text_parser}
-field_parser = FieldParser(fields, reader=reader)
+field_parser = FieldParser(fields, reader=reader, seed=FLAGS.rand_seed)
 
 batcher = EssayBatcher(reader=field_parser,
                        max_word_length=max_word_length,
@@ -224,7 +222,7 @@ with tf.variable_scope("Model",
     def training_op(notrain=[]):
         tvars = [v for v in tf.trainable_variables() if v.name.split('/')[1] not in notrain]
         grads, global_norm = tf.clip_by_global_norm(tf.gradients(train_loss, tvars), FLAGS.max_grad_norm)
-        return optimizer.apply_gradients(zip(grads, tvars), global_step=global_step)
+        return optimizer.apply_gradients(zip(grads, tvars), global_step=global_step), global_norm
     
     train_ops = []
     if embed.char:
@@ -234,9 +232,9 @@ with tf.variable_scope("Model",
         
     def train_op(epoch):
         if embed.char:
-            if epoch>8:
+            if epoch>6:
                 return train_ops[2]
-            if epoch>4:
+            if epoch>3:
                 return train_ops[1]
         return train_ops[0]
     
@@ -286,36 +284,41 @@ with graph.as_default(), tf.Session() as sess:
     
     valid_batches, valid_ids, best_val_qwk = [],None,0
     epochs, epoch = FLAGS.epochs, 0
+    k = FLAGS.print_every*FLAGS.batch_size
     while epoch < epochs:
         epoch+=1
         tic()
         print('==================================\tEPOCH {}\t\t=================================='.format(epoch))
         ''' TRAINING '''
-        losses, qwks, P, Y, batch = [],[],[],[],0
-        for b in batcher.batch_stream(stop=True, skip_ids=valid_ids, c=embed.char, w=embed.word):
+        losses, qwks, norms, P, Y, batch = [],[],[],[],[],0
+        for b in batcher.batch_stream(stop=True, skip_ids=valid_ids, c=embed.char, w=embed.word, min_cut=FLAGS.min_cut):
             batch+=1
             if epoch==1 and U.rng.rand()<FLAGS.valid_cut:
                 valid_batches.append(b)
                 continue
             
             feed_dict = { inputs: b.x, targets: b.y, seq_len: b.s, keep_prob: 1.0-FLAGS.dropout }
-            fetches = [train_loss, train_op(epoch), train_qwk, preds]
             
-            loss, _, kappa, p = sess.run(
+            train_step, global_norm = train_op(epoch)
+            fetches = [train_step, global_norm, train_loss, preds]
+            
+            _, gnorm, loss, p = sess.run(
                 fetches,
                 feed_dict)
             
             losses.append(loss)
-            qwks.append(kappa)
+            norms.append(gnorm)
+            P.extend(np.squeeze(p)); Y.extend(np.squeeze(b.y))
             word_count = batcher.word_count(reset=False)
             sec = toc(reset=False)
             wps = int(word_count/sec)
-            P.extend(np.squeeze(p)); Y.extend(np.squeeze(b.y)); kappa = U.nkappa(Y,P)
             
             if batch % FLAGS.print_every == 0:
+                kappa = U.nkappa(Y[-k:],P[-k:])
                 sys.stdout.write('\tqwk={0:0.3g}'.format(kappa))
                 sys.stdout.write('|mse={0:0.3g}'.format(loss))
                 sys.stdout.write('|wps={0}'.format(wps))
+                sys.stdout.write('|gnm={0:0.2g}'.format(gnorm))
                 sys.stdout.flush()
         
         ## POST TRAIN EPOCH ##    
@@ -327,7 +330,7 @@ with graph.as_default(), tf.Session() as sess:
         word_count = batcher.word_count()
         sec = toc()
         wps = int(word_count/sec)
-        QWK = U.nkappa(Y,P)#QWK = np.mean(qwks)
+        QWK = U.nkappa(Y,P)
         train_msg = 'Epoch {0}\tTRAIN Loss : {1:0.4}\tTRAIN Kappa : {2:0.4}\t{3:0.2g}min|{4}wps'.format(epoch, np.mean(losses), QWK, float(sec)/60.0, wps)
         print('\n[CURRENT]\t' + train_msg)
         
@@ -337,12 +340,12 @@ with graph.as_default(), tf.Session() as sess:
         for b in valid_batches:
             batch+=1
             feed_dict = { inputs: b.x, targets: b.y, seq_len: b.s, keep_prob: 1.0 }
-            loss, kappa, p = sess.run( [train_loss, train_qwk, preds], feed_dict)
+            loss, p = sess.run( [train_loss, preds], feed_dict)
             losses.append(loss)
-            qwks.append(kappa)
-            P.extend(np.squeeze(p)); Y.extend(np.squeeze(b.y)); kappa = U.nkappa(Y,P)
+            P.extend(np.squeeze(p)); Y.extend(np.squeeze(b.y))
             
             if batch % FLAGS.print_every == 0:
+                kappa = U.nkappa(Y[-k:],P[-k:])
                 sys.stdout.write('\tmse={0:0.4}'.format(loss))
                 sys.stdout.write('|qwk={0:0.4}\n'.format(kappa))
                 sys.stdout.flush()
